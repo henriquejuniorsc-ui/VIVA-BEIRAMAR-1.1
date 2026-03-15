@@ -2,13 +2,16 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import CockpitDashboard from './components/dashboard/CockpitDashboard';
 import FollowUpsPage from './components/followups/FollowUps';
 import ComissoesPage from './components/comissoes/Comissoes';
+import AdminImoveis from './components/imoveis/AdminImoveis';
+import ConversasPage from './components/conversas/ConversasPage';
+import RelatoriosPage from './components/relatorios/RelatoriosPage';
 import {
   LayoutDashboard, Home, Users, Settings, LogOut, Search, Plus,
   X, Check, AlertCircle, MapPin, BedDouble, Bath, Car, Maximize,
   ChevronRight, Edit2, Trash2, Image as ImageIcon, Phone, Mail,
   User, Calendar, DollarSign, ArrowRight, Menu, Loader2, UploadCloud,
   MessageSquare, Send, Paperclip, Smile, MoreVertical, CheckCheck, Clock, RefreshCw, Info, PhoneForwarded,
-  CalendarDays, ChevronLeft, Calendar as CalendarIcon, MapIcon, AlignLeft, Bell
+  CalendarDays, ChevronLeft, Calendar as CalendarIcon, MapIcon, AlignLeft, Bell, BarChart3
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip,
@@ -111,7 +114,7 @@ const Button = ({ children, variant = 'primary', className = '', isLoading, ...p
 };
 
 let toastTimeout;
-const Toast = ({ message, type, onClose }) => {
+const Toast = ({ message, type, onClose, action, actionLabel }) => {
   if (!message) return null;
   const types = {
     success: 'bg-emerald-50 text-emerald-800 border-emerald-200',
@@ -122,6 +125,12 @@ const Toast = ({ message, type, onClose }) => {
   return (
     <div className={`fixed bottom-4 right-4 z-[9999] flex items-center p-4 rounded-xl border shadow-lg transition-all transform animate-slide-in ${types[type] || types.info}`}>
       <span className="font-medium mr-3">{message}</span>
+      {action && (
+        <button onClick={() => { action(); onClose(); }}
+          className="px-3 py-1 bg-[#C4A265] text-white text-xs rounded-lg font-medium mr-2 hover:bg-[#b89355]">
+          {actionLabel || 'Ação'}
+        </button>
+      )}
       <button onClick={onClose} className="p-1 hover:bg-black/5 rounded-full"><X className="w-4 h-4" /></button>
     </div>
   );
@@ -201,15 +210,144 @@ const Dashboard = ({ leads, properties, appointments }) => {
   );
 };
 
-// 2. CRM / LEADS
+// 2. CRM / LEADS (enriched with pipeline_deals + drag-and-drop + sync)
 const CRM = ({ leads, properties, updateLead, setToast, reloadData, openAgendaModal }) => {
   const [view, setView] = useState('kanban');
   const [searchTerm, setSearchTerm] = useState('');
+  const [deals, setDeals] = useState([]);
+  const [dealModal, setDealModal] = useState(null);
+  const [draggedLead, setDraggedLead] = useState(null);
+  const [dragOverStage, setDragOverStage] = useState(null);
+
+  // Fetch deals
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`${supabaseUrl}/rest/v1/pipeline_deals?select=*`, {
+          headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}`, 'Content-Type': 'application/json' },
+        });
+        const data = await r.json();
+        if (Array.isArray(data)) setDeals(data);
+      } catch (e) { console.error('CRM deals fetch:', e); }
+    })();
+  }, []);
+
+  const getDealForLead = useCallback((lead) => {
+    return deals.find(d =>
+      (d.lead_uuid && d.lead_uuid === lead.id) ||
+      (d.lead_phone && lead.phone && d.lead_phone.replace(/\D/g, '') === lead.phone.replace(/\D/g, ''))
+    ) || null;
+  }, [deals]);
 
   const filteredLeads = leads.filter(l =>
     l.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
     (l.phone && l.phone.includes(searchTerm))
   );
+
+  // --- Drag and drop ---
+  const handleDragStart = (e, lead) => {
+    setDraggedLead(lead);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', lead.id);
+    e.currentTarget.style.opacity = '0.5';
+  };
+
+  const handleDragEnd = (e) => {
+    e.currentTarget.style.opacity = '1';
+    setDraggedLead(null);
+    setDragOverStage(null);
+  };
+
+  const handleDragOver = (e, stage) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setDragOverStage(stage);
+  };
+
+  const handleDragLeave = () => {
+    setDragOverStage(null);
+  };
+
+  const handleDrop = async (e, newStage) => {
+    e.preventDefault();
+    setDragOverStage(null);
+    if (!draggedLead || draggedLead.stage === newStage) return;
+
+    const oldStage = draggedLead.stage;
+    const lead = draggedLead;
+
+    // Optimistic update
+    updateLead({ ...lead, stage: newStage });
+
+    // Sync: update DB + deal + auto follow-up
+    const { onLeadStageChange } = await import('./hooks/useSyncLeadStage.js');
+    const result = await onLeadStageChange(lead, newStage, oldStage);
+
+    if (result.updatedLead) {
+      updateLead(result.updatedLead);
+    }
+
+    // Suggest agenda if moved to "Visita Agendada"
+    if (result.shouldSuggestAgenda) {
+      setToast({
+        message: `📅 Deseja agendar uma visita com ${lead.name}?`,
+        type: 'info',
+        action: () => openAgendaModal({
+          lead_id: lead.id,
+          lead_uuid: lead.id,
+          lead_name: lead.name,
+          lead_phone: lead.phone,
+          appointment_type: 'visita',
+        }),
+        actionLabel: 'Agendar',
+      });
+    } else {
+      setToast({ message: `${lead.name} movido para ${newStage}`, type: 'success' });
+    }
+  };
+
+  // Save deal
+  const saveDeal = async (leadId, dealData, existingDealId) => {
+    try {
+      const hdrs = { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}`, 'Content-Type': 'application/json', Prefer: 'return=representation' };
+      const lead = leads.find(l => l.id === leadId);
+      const body = {
+        ...dealData,
+        lead_uuid: leadId,
+        lead_name: lead?.name || '',
+        lead_phone: lead?.phone || '',
+        commission_value: (Number(dealData.deal_value) || 0) * (Number(dealData.commission_rate) || 0) / 100,
+      };
+      let result;
+      if (existingDealId) {
+        const r = await fetch(`${supabaseUrl}/rest/v1/pipeline_deals?id=eq.${existingDealId}`, {
+          method: 'PATCH', headers: hdrs, body: JSON.stringify(body),
+        });
+        result = await r.json();
+      } else {
+        const r = await fetch(`${supabaseUrl}/rest/v1/pipeline_deals`, {
+          method: 'POST', headers: hdrs, body: JSON.stringify(body),
+        });
+        result = await r.json();
+      }
+      if (Array.isArray(result) && result[0]) {
+        setDeals(prev => {
+          const f = prev.filter(d => d.id !== result[0].id);
+          return [...f, result[0]];
+        });
+      }
+      setToast({ message: 'Negócio salvo!', type: 'success' });
+      setDealModal(null);
+    } catch (e) {
+      setToast({ message: 'Erro ao salvar negócio.', type: 'error' });
+    }
+  };
+
+  const ProbBadge = ({ prob }) => {
+    if (!prob && prob !== 0) return null;
+    const cls = prob >= 70 ? 'bg-green-50 text-green-700' : prob >= 40 ? 'bg-amber-50 text-amber-700' : 'bg-gray-100 text-gray-500';
+    return <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${cls}`}>{prob}%</span>;
+  };
 
   return (
     <div className="h-full flex flex-col fade-in">
@@ -221,13 +359,9 @@ const CRM = ({ leads, properties, updateLead, setToast, reloadData, openAgendaMo
         <div className="flex items-center space-x-3 w-full md:w-auto">
           <div className="relative w-full md:w-64">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8A8A8A]" />
-            <input
-              type="text"
-              placeholder="Buscar leads..."
-              value={searchTerm}
+            <input type="text" placeholder="Buscar leads..." value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-9 pr-4 py-2 rounded-lg border border-[#E8E2D8] bg-white text-sm focus:ring-2 focus:ring-[#C4A265] outline-none"
-            />
+              className="w-full pl-9 pr-4 py-2 rounded-lg border border-[#E8E2D8] bg-white text-sm focus:ring-2 focus:ring-[#C4A265] outline-none" />
           </div>
         </div>
       </div>
@@ -237,29 +371,87 @@ const CRM = ({ leads, properties, updateLead, setToast, reloadData, openAgendaMo
           <div className="flex h-full overflow-x-auto pb-4 gap-4 hide-scrollbar items-start">
             {KANBAN_STAGES.map(stage => {
               const stageLeads = filteredLeads.filter(l => l.stage === stage);
+              const stageDealsSum = stageLeads.reduce((sum, l) => {
+                const deal = getDealForLead(l);
+                return sum + (deal ? Number(deal.deal_value) || 0 : 0);
+              }, 0);
+              const isDragOver = dragOverStage === stage;
               return (
-                <div key={stage} className={`flex-shrink-0 w-80 bg-[#F5F0E8] rounded-xl flex flex-col max-h-full ${stage === 'Perdido' ? 'opacity-70' : ''}`}>
-                  <div className="p-3 font-semibold text-[#1B2B3A] flex justify-between items-center border-b border-[#E8E2D8]/50">
-                    <span>{stage}</span>
-                    <span className="bg-white text-xs px-2 py-0.5 rounded-full text-[#8A8A8A]">{stageLeads.length}</span>
+                <div key={stage}
+                  className={`flex-shrink-0 w-80 bg-[#F5F0E8] rounded-xl flex flex-col max-h-full transition-all ${stage === 'Perdido' ? 'opacity-70' : ''} ${isDragOver ? 'ring-2 ring-[#C4A265] bg-[#C4A265]/5' : ''}`}
+                  onDragOver={(e) => handleDragOver(e, stage)}
+                  onDragLeave={handleDragLeave}
+                  onDrop={(e) => handleDrop(e, stage)}>
+                  <div className="p-3 border-b border-[#E8E2D8]/50">
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-[#1B2B3A] text-sm">{stage}</span>
+                      <span className="bg-white text-xs px-2 py-0.5 rounded-full text-[#8A8A8A]">{stageLeads.length}</span>
+                    </div>
+                    {stageDealsSum > 0 && (
+                      <p className="text-[10px] text-[#C4A265] font-medium mt-1">{formatCurrency(stageDealsSum)}</p>
+                    )}
                   </div>
                   <div className="p-3 overflow-y-auto flex-1 space-y-3 custom-scrollbar">
-                    {stageLeads.map(lead => (
-                      <div key={lead.id} className="bg-white p-4 rounded-xl shadow-sm border border-[#E8E2D8] hover:border-[#C4A265] transition-colors group">
-                        <div className="flex justify-between items-start mb-2">
-                          <h4 className="font-bold text-[#1B2B3A] text-sm">{lead.name}</h4>
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${TEMP_COLORS[lead.temperatura] || 'bg-slate-200 text-slate-800'}`}>{lead.temperatura}</span>
+                    {stageLeads.map(lead => {
+                      const deal = getDealForLead(lead);
+                      return (
+                        <div key={lead.id}
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, lead)}
+                          onDragEnd={handleDragEnd}
+                          className="bg-white p-4 rounded-xl shadow-sm border border-[#E8E2D8] hover:border-[#C4A265] transition-colors group cursor-grab active:cursor-grabbing"
+                          onClick={() => setDealModal({ lead, deal })}>
+                          <div className="flex justify-between items-start mb-1">
+                            <h4 className="font-bold text-[#1B2B3A] text-sm">{lead.name}</h4>
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${TEMP_COLORS[lead.temperatura] || 'bg-slate-200 text-slate-800'}`}>{lead.temperatura}</span>
+                          </div>
+                          {deal && (
+                            <div className="mb-2 space-y-1">
+                              {deal.property_title && (
+                                <p className="text-[11px] text-[#5A5A5A] truncate">
+                                  {deal.property_title}{deal.property_neighborhood ? ` — ${deal.property_neighborhood}` : ''}
+                                </p>
+                              )}
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-bold text-[#C4A265]">{formatCurrency(deal.deal_value)}</span>
+                                {deal.commission_value > 0 && (
+                                  <span className="text-[10px] text-green-600">Com. {formatCurrency(deal.commission_value)}</span>
+                                )}
+                              </div>
+                              {deal.probability != null && (
+                                <div className="flex items-center gap-1.5">
+                                  <div className="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                                    <div className={`h-full rounded-full ${deal.probability >= 70 ? 'bg-green-500' : deal.probability >= 40 ? 'bg-amber-400' : 'bg-gray-300'}`}
+                                      style={{ width: `${deal.probability}%` }} />
+                                  </div>
+                                  <ProbBadge prob={deal.probability} />
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {!deal && (
+                            <p className="text-xs text-[#5A5A5A] mb-2 flex items-center">
+                              <Phone className="w-3 h-3 mr-1" /> {formatPhone(lead.phone)}
+                            </p>
+                          )}
+                          <div className="flex items-center space-x-2 pt-2 border-t border-[#E8E2D8]">
+                            <Button variant="outlineGray" className="flex-1 py-1 text-xs" onClick={(e) => { e.stopPropagation(); openAgendaModal({ lead_id: lead.id, lead_uuid: lead.id, lead_name: lead.name, lead_phone: lead.phone }); }}>
+                              <CalendarDays className="w-3 h-3 mr-1" /> Agendar
+                            </Button>
+                            {!deal && (
+                              <Button variant="outlineGray" className="flex-1 py-1 text-xs" onClick={(e) => { e.stopPropagation(); setDealModal({ lead, deal: null }); }}>
+                                <DollarSign className="w-3 h-3 mr-1" /> Negócio
+                              </Button>
+                            )}
+                          </div>
                         </div>
-                        <p className="text-xs text-[#5A5A5A] mb-3 flex items-center">
-                          <Phone className="w-3 h-3 mr-1" /> {formatPhone(lead.phone)}
-                        </p>
-                        <div className="flex items-center space-x-2 mt-2 pt-2 border-t border-[#E8E2D8]">
-                          <Button variant="outlineGray" className="flex-1 py-1 text-xs" onClick={() => openAgendaModal({ lead_id: lead.id, lead_name: lead.name, lead_phone: lead.phone })}>
-                            <CalendarDays className="w-3 h-3 mr-1" /> Agendar
-                          </Button>
-                        </div>
+                      );
+                    })}
+                    {isDragOver && stageLeads.length === 0 && (
+                      <div className="border-2 border-dashed border-[#C4A265] rounded-xl p-4 text-center text-xs text-[#C4A265]">
+                        Solte aqui
                       </div>
-                    ))}
+                    )}
                   </div>
                 </div>
               );
@@ -271,36 +463,149 @@ const CRM = ({ leads, properties, updateLead, setToast, reloadData, openAgendaMo
           </div>
         )}
       </div>
+
+      {dealModal && (
+        <DealModal lead={dealModal.lead} deal={dealModal.deal} properties={properties}
+          onClose={() => setDealModal(null)} onSave={saveDeal} />
+      )}
     </div>
   );
 };
 
-// 3. IMÓVEIS
-const Properties = ({ properties, reloadData, setToast, openAgendaModal }) => {
+// Deal Modal — create/edit deal for a lead
+const DealModal = ({ lead, deal, properties, onClose, onSave }) => {
+  const [form, setForm] = useState({
+    property_id: deal?.property_id || '',
+    property_title: deal?.property_title || '',
+    property_neighborhood: deal?.property_neighborhood || '',
+    property_price: deal?.property_price || '',
+    deal_value: deal?.deal_value || '',
+    commission_rate: deal?.commission_rate || 3,
+    probability: deal?.probability || 50,
+    expected_close_date: deal?.expected_close_date || '',
+    status: deal?.status || 'novo',
+    notes: deal?.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const handlePropertyChange = (propId) => {
+    const prop = properties.find(p => p.id === propId);
+    if (prop) {
+      set('property_id', prop.id);
+      setForm(f => ({
+        ...f,
+        property_id: prop.id,
+        property_title: prop.title,
+        property_neighborhood: prop.neighborhood || '',
+        property_price: prop.price || '',
+        deal_value: f.deal_value || prop.price || '',
+      }));
+    }
+  };
+
+  const commissionValue = ((Number(form.deal_value) || 0) * (Number(form.commission_rate) || 0)) / 100;
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    await onSave(lead.id, form, deal?.id);
+    setSaving(false);
+  };
+
   return (
-    <div className="space-y-6 fade-in">
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-        {properties.map(prop => (
-          <div key={prop.id} className="bg-white rounded-2xl shadow-sm border border-[#E8E2D8] overflow-hidden hover:shadow-lg transition-all flex flex-col">
-            <div className="aspect-[16/10] bg-slate-100 relative">
-              {prop.images && prop.images.length > 0 ? (
-                <img src={prop.images[0]} className="w-full h-full object-cover" alt={prop.title} />
-              ) : <ImageIcon className="w-10 h-10 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-20" />}
+    <div className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto custom-scrollbar animate-scale-in" onClick={e => e.stopPropagation()}>
+        <div className="p-5 border-b border-[#E8E2D8] bg-[#FAF8F5] flex justify-between items-center sticky top-0 z-10">
+          <div>
+            <h2 className="text-lg font-bold font-serif text-[#1B2B3A]">{deal ? 'Editar Negócio' : 'Novo Negócio'}</h2>
+            <p className="text-xs text-[#8A8A8A]">{lead.name} — {formatPhone(lead.phone)}</p>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-[#E8E2D8] rounded-full"><X className="w-5 h-5" /></button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-5 space-y-4">
+          {/* Imóvel */}
+          <div>
+            <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Imóvel</label>
+            <select value={form.property_id} onChange={e => handlePropertyChange(e.target.value)}
+              className="w-full p-2.5 rounded-xl border border-[#E8E2D8] focus:border-[#C4A265] outline-none bg-white text-sm">
+              <option value="">Selecione um imóvel...</option>
+              {properties.map(p => <option key={p.id} value={p.id}>{p.title} — {p.neighborhood || 'N/A'}</option>)}
+            </select>
+            {form.property_title && !form.property_id && (
+              <p className="text-xs text-[#8A8A8A] mt-1">Imóvel atual: {form.property_title}</p>
+            )}
+          </div>
+
+          {/* Valor + Comissão */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Valor do negócio (R$)</label>
+              <input type="number" value={form.deal_value} onChange={e => set('deal_value', e.target.value)}
+                className="w-full p-2.5 rounded-xl border border-[#E8E2D8] focus:border-[#C4A265] outline-none text-sm" placeholder="0" />
+              {form.deal_value > 0 && <p className="text-xs text-[#C4A265] mt-1">{formatCurrency(form.deal_value)}</p>}
             </div>
-            <div className="p-5 flex-1 flex flex-col">
-              <h3 className="font-serif font-bold text-lg text-[#1B2B3A] line-clamp-2">{prop.title}</h3>
-              <p className="text-[#C4A265] font-bold text-xl my-2 flex-1">{formatCurrency(prop.price)}</p>
-              <Button variant="outline" className="w-full py-1.5 mt-2 text-sm" onClick={() => openAgendaModal({ property_id: prop.id, property_title: prop.title, address: `${prop.address || ''}, ${prop.neighborhood || ''}` })}>
-                <CalendarDays className="w-4 h-4 mr-2" /> Agendar Visita
-              </Button>
+            <div>
+              <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Comissão (%)</label>
+              <input type="number" step="0.5" value={form.commission_rate} onChange={e => set('commission_rate', e.target.value)}
+                className="w-full p-2.5 rounded-xl border border-[#E8E2D8] focus:border-[#C4A265] outline-none text-sm" placeholder="3" />
+              {commissionValue > 0 && <p className="text-xs text-green-600 mt-1">{formatCurrency(commissionValue)}</p>}
             </div>
           </div>
-        ))}
-        {properties.length === 0 && <p className="text-[#8A8A8A]">Nenhum imóvel cadastrado.</p>}
+
+          {/* Probabilidade */}
+          <div>
+            <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Probabilidade de fechamento: {form.probability}%</label>
+            <input type="range" min="0" max="100" step="5" value={form.probability}
+              onChange={e => set('probability', Number(e.target.value))}
+              className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#C4A265]" />
+            <div className="flex justify-between text-[10px] text-[#8A8A8A] mt-1">
+              <span>0%</span><span>50%</span><span>100%</span>
+            </div>
+          </div>
+
+          {/* Previsão + Status */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Previsão de fechamento</label>
+              <input type="date" value={form.expected_close_date} onChange={e => set('expected_close_date', e.target.value)}
+                className="w-full p-2.5 rounded-xl border border-[#E8E2D8] focus:border-[#C4A265] outline-none text-sm bg-white" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Status do deal</label>
+              <select value={form.status} onChange={e => set('status', e.target.value)}
+                className="w-full p-2.5 rounded-xl border border-[#E8E2D8] focus:border-[#C4A265] outline-none bg-white text-sm">
+                <option value="novo">Novo</option>
+                <option value="contato">Contato</option>
+                <option value="visita_agendada">Visita Agendada</option>
+                <option value="visita_realizada">Visita Realizada</option>
+                <option value="proposta">Proposta</option>
+                <option value="contrato">Contrato</option>
+                <option value="fechado">Fechado</option>
+                <option value="perdido">Perdido</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Notas */}
+          <div>
+            <label className="block text-sm font-medium text-[#1B2B3A] mb-1">Observações</label>
+            <textarea value={form.notes} onChange={e => set('notes', e.target.value)} rows={2}
+              className="w-full p-2.5 rounded-xl border border-[#E8E2D8] focus:border-[#C4A265] outline-none resize-none text-sm" placeholder="Notas sobre o negócio..." />
+          </div>
+
+          <div className="flex justify-end gap-3 pt-4 border-t border-[#E8E2D8]">
+            <Button variant="outlineGray" type="button" onClick={onClose}>Cancelar</Button>
+            <Button type="submit" isLoading={saving}>{deal ? 'Salvar Alterações' : 'Criar Negócio'}</Button>
+          </div>
+        </form>
       </div>
     </div>
   );
 };
+
+// 3. IMÓVEIS — Movido para src/components/imoveis/AdminImoveis.jsx
 
 // 4. CONFIGURAÇÕES
 const SettingsPage = ({ uazConfig, setUazConfig, googleConfig, setGoogleConfig, setToast }) => {
@@ -321,9 +626,9 @@ const SettingsPage = ({ uazConfig, setUazConfig, googleConfig, setGoogleConfig, 
     <div className="max-w-3xl mx-auto space-y-6 fade-in pb-12">
       <div className="bg-white p-8 rounded-2xl shadow-sm border border-[#E8E2D8]">
         <div className="flex items-center space-x-4 mb-8">
-          <div className="w-16 h-16 bg-[#1B2B3A] rounded-full flex items-center justify-center text-white text-2xl font-serif">VB</div>
+          <img src="/logo-viva-beiramar.png" alt="Viva Beiramar" className="w-16 h-16 rounded-full shadow-md" />
           <div>
-            <h2 className="text-xl font-bold font-serif text-[#1B2B3A]">Viva Beiramar Admin</h2>
+            <h2 className="text-xl font-bold font-serif text-[#1B2B3A]">Viva Beiramar</h2>
             <p className="text-[#8A8A8A]">contato@vivabeiramar.com.br</p>
           </div>
         </div>
@@ -369,18 +674,7 @@ const SettingsPage = ({ uazConfig, setUazConfig, googleConfig, setGoogleConfig, 
   );
 };
 
-// 5. CONVERSAS
-const Conversas = ({ leads, uazConfig, setToast, goToCRM }) => {
-  return (
-    <div className="h-[calc(100vh-8rem)] bg-white rounded-2xl shadow-sm border border-[#E8E2D8] flex items-center justify-center p-8 fade-in text-center flex-col">
-      <div className="w-20 h-20 bg-[#25D366]/10 rounded-full flex items-center justify-center mx-auto mb-6">
-        <MessageSquare className="w-10 h-10 text-[#25D366]" fill="currentColor" />
-      </div>
-      <h2 className="text-2xl font-bold font-serif text-[#1B2B3A] mb-3">WhatsApp Conectado</h2>
-      <p className="text-[#8A8A8A] max-w-sm">Módulo carregado. Configure o UAZAPI nas Configurações para ativar as conversas.</p>
-    </div>
-  );
-};
+// 5. CONVERSAS — Movido para src/components/conversas/ConversasPage.jsx
 
 // 6. AGENDA
 const Agenda = ({ appointments, setAppointments, leads, properties, googleConfig, openAgendaModal, setToast }) => {
@@ -857,17 +1151,35 @@ export default function App() {
   useEffect(() => { loadData(); }, [loadData]);
 
   const saveAppointment = async (payload) => {
+    // Carry lead_uuid from lead_id if available
+    if (payload.lead_id && !payload.lead_uuid) {
+      payload.lead_uuid = payload.lead_id;
+    }
+
     if (payload._delete) {
       setAppointments(prev => prev.filter(a => a.id !== payload.id));
       setToast({ message: 'Compromisso removido.', type: 'info' });
     } else {
       const isNew = !appointments.find(a => a.id === payload.id);
+      const wasNotCompleted = appointments.find(a => a.id === payload.id)?.status !== 'concluido';
       if (isNew) {
         setAppointments(prev => [...prev, payload]);
       } else {
         setAppointments(prev => prev.map(a => a.id === payload.id ? payload : a));
       }
       setToast({ message: 'Agendamento salvo com sucesso!', type: 'success' });
+
+      // Sync: when appointment is marked as completed → advance lead stage
+      if (payload.status === 'concluido' && wasNotCompleted && payload.lead_uuid) {
+        import('./hooks/useSyncLeadStage.js').then(async ({ onAppointmentCompleted }) => {
+          const updatedLead = await onAppointmentCompleted(payload);
+          if (updatedLead) {
+            setLeads(prev => prev.map(l => l.id === updatedLead.id ? updatedLead : l));
+            setToast({ message: `${updatedLead.name} avançou para "${updatedLead.stage}"`, type: 'success' });
+          }
+        });
+      }
+
       if (googleConfig.token) {
         console.log("Mock POST to Google Calendar API with token:", googleConfig.token);
       }
@@ -914,11 +1226,9 @@ export default function App() {
       <div className="min-h-screen bg-[#FAF8F5] flex items-center justify-center p-4">
         {toast && <Toast {...toast} onClose={() => setToastState(null)} />}
         <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border border-[#E8E2D8] text-center fade-in">
-          <div className="w-16 h-16 bg-[#1B2B3A] rounded-2xl mx-auto flex items-center justify-center mb-6 shadow-inner">
-            <Home className="w-8 h-8 text-[#C4A265]" />
-          </div>
-          <h1 className="text-3xl font-bold font-serif text-[#1B2B3A] mb-2">ImobiPro</h1>
-          <p className="text-[#8A8A8A] mb-8">Gestão de Alto Padrão</p>
+          <img src="/logo-viva-beiramar.png" alt="Viva Beiramar" className="w-20 h-20 mx-auto mb-6 rounded-full shadow-lg" />
+          <h1 className="text-3xl font-bold font-serif text-[#1B2B3A] mb-2">Viva Beiramar</h1>
+          <p className="text-[#8A8A8A] mb-8">Gestão Imobiliária</p>
           <form onSubmit={handleLogin} className="space-y-4 text-left">
             <div>
               <label className="block text-sm font-medium text-[#1B2B3A] mb-1">E-mail</label>
@@ -967,10 +1277,8 @@ export default function App() {
       {/* SIDEBAR */}
       <aside className={`fixed inset-y-0 left-0 z-50 w-64 bg-[#1B2B3A] text-white flex flex-col transition-transform transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 md:static md:flex-shrink-0`}>
         <div className="p-6 flex items-center space-x-3">
-          <div className="w-10 h-10 bg-[#C4A265] rounded-xl flex items-center justify-center">
-            <Home className="w-6 h-6 text-[#1B2B3A]" />
-          </div>
-          <span className="text-xl font-bold font-serif tracking-wide">ImobiPro</span>
+          <img src="/logo-viva-beiramar.png" alt="Viva Beiramar" className="w-10 h-10 rounded-full" />
+          <span className="text-xl font-bold font-serif tracking-wide">Viva Beiramar</span>
         </div>
         <nav className="flex-1 px-4 space-y-2 mt-4">
           <NavItem icon={LayoutDashboard} label="Dashboard" route="dashboard" />
@@ -980,6 +1288,7 @@ export default function App() {
           <NavItem icon={CalendarDays} label="Agenda" route="agenda" alert={!!upcomingAppointment} />
           <NavItem icon={Home} label="Imóveis" route="properties" />
           <NavItem icon={DollarSign} label="Comissões" route="comissoes" />
+          <NavItem icon={BarChart3} label="Relatórios" route="relatorios" />
           <NavItem icon={Settings} label="Configurações" route="settings" />
         </nav>
         <div className="p-4 border-t border-white/10">
@@ -1009,7 +1318,7 @@ export default function App() {
               <Menu className="w-6 h-6" />
             </button>
             <h1 className="text-xl font-bold font-serif text-[#1B2B3A] capitalize">
-              {currentRoute === 'crm' ? 'Gestão de Leads' : currentRoute === 'properties' ? 'Catálogo de Imóveis' : currentRoute}
+              {currentRoute === 'crm' ? 'Gestão de Leads' : currentRoute === 'properties' ? 'Imóveis' : currentRoute}
             </h1>
           </div>
           <div className="flex items-center space-x-4">
@@ -1020,11 +1329,12 @@ export default function App() {
         <div className={`flex-1 overflow-auto relative ${currentRoute === 'conversas' ? 'p-2 md:p-6' : 'p-4 md:p-8'}`}>
           {currentRoute === 'dashboard' && <CockpitDashboard session={session} />}
           {currentRoute === 'crm' && <CRM leads={leads} properties={properties} updateLead={updateLeadInState} setToast={setToast} reloadData={loadData} openAgendaModal={setAgendaModalData} />}
-          {currentRoute === 'conversas' && <Conversas leads={leads} uazConfig={uazConfig} setToast={setToast} goToCRM={() => setCurrentRoute('crm')} />}
+          {currentRoute === 'conversas' && <ConversasPage session={session} setCurrentRoute={setCurrentRoute} />}
           {currentRoute === 'agenda' && <Agenda appointments={appointments} setAppointments={setAppointments} leads={leads} properties={properties} googleConfig={googleConfig} openAgendaModal={setAgendaModalData} setToast={setToast} />}
-          {currentRoute === 'properties' && <Properties properties={properties} reloadData={loadData} setToast={setToast} openAgendaModal={setAgendaModalData} />}
+          {currentRoute === 'properties' && <AdminImoveis session={session} />}
           {currentRoute === 'followups' && <FollowUpsPage session={session} />}
           {currentRoute === 'comissoes' && <ComissoesPage session={session} />}
+          {currentRoute === 'relatorios' && <RelatoriosPage session={session} />}
           {currentRoute === 'settings' && <SettingsPage uazConfig={uazConfig} setUazConfig={setUazConfig} googleConfig={googleConfig} setGoogleConfig={setGoogleConfig} setToast={setToast} />}
         </div>
       </main>
